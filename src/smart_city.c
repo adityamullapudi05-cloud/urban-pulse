@@ -2,7 +2,7 @@
  * ============================================================================
  * Smart City RTOS Fault & Performance Monitoring Platform
  * 
- * Target: QNX Neutrino RTOS (Raspberry Pi 4/5 Cluster) & Cross-Platform POSIX/Win32
+ * Target: QNX Neutrino RTOS (Raspberry Pi 4/5 Cluster) & Standard POSIX
  * Architecture: Distributed 2-Node (Workload Node & Supervisor Node)
  * 
  * Conforms to: design.md
@@ -19,17 +19,6 @@
  */
 
 #define _GNU_SOURCE
-#define __USE_MINGW_ANSI_STDIO 1
-
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <process.h>
-#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,67 +30,6 @@
 #include <math.h>
 #include <inttypes.h>
 
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-#define FMT_U64 "%I64u"
-#else
-#define FMT_U64 "%llu"
-#endif
-
-/* ============================================================================
- * PORTABLE REAL-TIME THREADING & NETWORKING ABSTRACTION
- * ============================================================================ */
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-typedef int socklen_t;
-typedef HANDLE rt_thread_t;
-typedef CRITICAL_SECTION rt_mutex_t;
-typedef CONDITION_VARIABLE rt_cond_t;
-
-#define RT_MUTEX_INIT(m)        InitializeCriticalSection(m)
-#define RT_MUTEX_DESTROY(m)     DeleteCriticalSection(m)
-#define RT_MUTEX_LOCK(m)        EnterCriticalSection(m)
-#define RT_MUTEX_UNLOCK(m)      LeaveCriticalSection(m)
-#define RT_COND_INIT(c)         InitializeConditionVariable(c)
-#define RT_COND_SIGNAL(c)       WakeConditionVariable(c)
-#define RT_COND_WAIT(c, m)      SleepConditionVariableCS(c, m, INFINITE)
-
-typedef void* (*thread_func_t)(void*);
-typedef struct {
-    thread_func_t func;
-    void *arg;
-} win_thread_arg_t;
-
-static DWORD WINAPI win32_thread_trampoline(LPVOID lpParam) {
-    win_thread_arg_t *a = (win_thread_arg_t*)lpParam;
-    thread_func_t f = a->func;
-    void *arg = a->arg;
-    free(a);
-    f(arg);
-    return 0;
-}
-
-static inline int rt_thread_create(rt_thread_t *thread, int priority, thread_func_t func, void *arg) {
-    win_thread_arg_t *a = (win_thread_arg_t*)malloc(sizeof(win_thread_arg_t));
-    a->func = func;
-    a->arg = arg;
-    *thread = CreateThread(NULL, 0, win32_thread_trampoline, a, 0, NULL);
-    if (*thread == NULL) return -1;
-
-    int win_prio = THREAD_PRIORITY_NORMAL;
-    if (priority >= 20) win_prio = THREAD_PRIORITY_TIME_CRITICAL;
-    else if (priority >= 15) win_prio = THREAD_PRIORITY_HIGHEST;
-    else if (priority >= 12) win_prio = THREAD_PRIORITY_ABOVE_NORMAL;
-    else if (priority <= 5) win_prio = THREAD_PRIORITY_BELOW_NORMAL;
-    SetThreadPriority(*thread, win_prio);
-    return 0;
-}
-
-static inline void rt_thread_join(rt_thread_t thread) {
-    WaitForSingleObject(thread, INFINITE);
-    CloseHandle(thread);
-}
-
-#else
-/* QNX Neutrino RTOS / POSIX */
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -118,6 +46,11 @@ static inline void rt_thread_join(rt_thread_t thread) {
 #include <sys/syspage.h>
 #endif
 
+#define FMT_U64 "%" PRIu64
+
+/* ============================================================================
+ * REAL-TIME THREADING & SYNCHRONIZATION (QNX / POSIX)
+ * ============================================================================ */
 typedef pthread_t rt_thread_t;
 typedef pthread_mutex_t rt_mutex_t;
 typedef pthread_cond_t rt_cond_t;
@@ -154,7 +87,6 @@ static inline int rt_thread_create(rt_thread_t *thread, int priority, thread_fun
 static inline void rt_thread_join(rt_thread_t thread) {
     pthread_join(thread, NULL);
 }
-#endif
 
 /* ============================================================================
  * CONFIGURATION CONSTANTS & REAL-TIME PRIORITIES
@@ -350,36 +282,16 @@ static SystemContext g_sys;
  * HIGH-PRECISION MONOTONIC TIME UTILITIES
  * ============================================================================ */
 static inline uint64_t get_time_us(void) {
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-    static LARGE_INTEGER freq;
-    static int initialized = 0;
-    if (!initialized) {
-        QueryPerformanceFrequency(&freq);
-        initialized = 1;
-    }
-    LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
-    return (uint64_t)((counter.QuadPart * 1000000ULL) / freq.QuadPart);
-#else
     struct timespec ts;
-#if defined(CLOCK_MONOTONIC)
     clock_gettime(CLOCK_MONOTONIC, &ts);
-#else
-    clock_gettime(CLOCK_REALTIME, &ts);
-#endif
     return ((uint64_t)ts.tv_sec * 1000000ULL) + ((uint64_t)ts.tv_nsec / 1000ULL);
-#endif
 }
 
 static inline void sleep_ms(uint32_t ms) {
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-    Sleep(ms);
-#else
     struct timespec req;
     req.tv_sec = ms / 1000;
     req.tv_nsec = (ms % 1000) * 1000000L;
     nanosleep(&req, NULL);
-#endif
 }
 
 /* ============================================================================
@@ -861,11 +773,7 @@ static void* telemetry_sender_thread(void* arg) {
 
         printf("[Telemetry] Connecting to Supervisor at %s:%d...\n", g_sys.peer_ip, g_sys.peer_port);
         if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-#if defined(_WIN32) && !defined(__CYGWIN__)
-            closesocket(sock);
-#else
             close(sock);
-#endif
             sleep_ms(2000);
             continue;
         }
@@ -884,11 +792,7 @@ static void* telemetry_sender_thread(void* arg) {
         }
 
         g_sys.peer_connected = false;
-#if defined(_WIN32) && !defined(__CYGWIN__)
-        closesocket(sock);
-#else
         close(sock);
-#endif
         sleep_ms(1000);
     }
     return NULL;
@@ -909,11 +813,7 @@ static void* telemetry_receiver_thread(void* arg) {
     address.sin_port = htons((uint16_t)g_sys.peer_port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-#if defined(_WIN32) && !defined(__CYGWIN__)
-        closesocket(server_fd);
-#else
         close(server_fd);
-#endif
         return NULL;
     }
 
@@ -949,18 +849,10 @@ static void* telemetry_receiver_thread(void* arg) {
         printf("[Supervisor] Node 1 communication dropped!\n");
         g_sys.peer_connected = false;
         register_fault(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "Node 1 Communication Disconnected");
-#if defined(_WIN32) && !defined(__CYGWIN__)
-        closesocket(new_socket);
-#else
         close(new_socket);
-#endif
     }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    closesocket(server_fd);
-#else
     close(server_fd);
-#endif
     return NULL;
 }
 
@@ -1238,10 +1130,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
 
     init_system(mode, peer_ip, peer_port);
 
@@ -1277,8 +1165,5 @@ int main(int argc, char* argv[]) {
     g_sys.running = false;
     sleep_ms(500);
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSACleanup();
-#endif
     return 0;
 }

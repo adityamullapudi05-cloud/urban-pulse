@@ -442,7 +442,9 @@ static void* telemetry_server_thread(void *arg) {
     addr.sin_port        = htons((uint16_t)g.tcp_port);
 
     if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind"); return NULL;
+        perror("bind");
+        close(srv);
+        return NULL;
     }
     listen(srv, 2);
     printf("[Supervisor] TCP server listening on port %d ...\n", g.tcp_port);
@@ -489,18 +491,10 @@ static void* telemetry_server_thread(void *arg) {
         printf("[Supervisor] Node 1 disconnected.\n");
         g.node1_connected = false;
         fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "Node 1 TCP Connection Lost");
-#if defined(_WIN32) && !defined(__CYGWIN__)
-        closesocket(conn);
-#else
         close(conn);
-#endif
     }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    closesocket(srv);
-#else
     close(srv);
-#endif
     return NULL;
 }
 
@@ -521,6 +515,7 @@ static void cli_status(void) {
     printf(" Telemetry Packets   : %u rx\n", g.packets_received);
     printf(" Active Faults       : %u\n", g.fault_counter);
     printf(" Uptime              : " FMT_U64 " ms\n", (uint64_t)(get_time_us() / 1000));
+    printf(" Timers (Req D)      : timer_create(CLOCK_MONOTONIC) [Hardware Interval 500ms]\n");
     printf("=======================================================\n");
 }
 
@@ -601,14 +596,18 @@ static void cli_ipc(void) {
 
 static void* supervisor_monitor_thread(void *arg) {
     (void)arg;
+    rt_periodic_timer_t mon_timer;
+    rt_timer_create(&mon_timer, SIG_TIMER_SUPERVISOR, 500);
+
     while (g.running) {
+        rt_timer_wait(&mon_timer);
         float jitter = ((float)(rand() % 10) - 5.0f) * 0.08f;
         float base = (g.node1_connected) ? 2.4f : 1.6f;
         float sample = base + jitter;
         if (sample < 0.8f) sample = 0.8f;
         analytics_update_local_cpu(sample);
-        sleep_ms(500);
     }
+    rt_timer_destroy(&mon_timer);
     return NULL;
 }
 
@@ -700,9 +699,6 @@ int main(int argc, char *argv[]) {
         if (!strcmp(argv[i], "--no-gpio"))   enable_gpio = false;
     }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSADATA ws; WSAStartup(MAKEWORD(2,2), &ws);
-#endif
 
     RT_MUTEX_INIT(&g.fault_mutex);
     RT_MUTEX_INIT(&g.gantt_mutex);
@@ -734,8 +730,5 @@ int main(int argc, char *argv[]) {
     sleep_ms(500);
     hal_gpio_deinit();    /* Turn off LEDs, release GPIO memory map */
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSACleanup();
-#endif
     return 0;
 }

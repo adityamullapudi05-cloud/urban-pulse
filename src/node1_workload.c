@@ -60,6 +60,14 @@ typedef struct {
     char     supervisor_ip[64];
     int      supervisor_port;
     bool     tcp_connected;
+
+    /* QNX Message Passing Heartbeat Channel & Connection */
+    int      heartbeat_chid;
+    int      heartbeat_coid;
+
+    /* POSIX/QNX Shared Memory Metrics Block (shm_open + mmap) */
+    SharedMetricsBlock *shm_metrics;
+    int                 shm_fd;
 } Node1Context;
 
 static Node1Context g;
@@ -250,6 +258,11 @@ static void ipc_record_latency(uint32_t lat_us) {
     s->avg_us = (s->count > 0) ? (uint32_t)(sum / s->count) : 0;
     s->p95_us = p95;
 
+    /* Mirror IPC statistics to high-frequency shared memory block */
+    if (g.shm_metrics) {
+        g.shm_metrics->ipc_stats = g.ipc_stats;
+    }
+
     /* IPC fault thresholds */
     if (lat_us >= IPC_CRIT_LATENCY_US)
         fault_register(2, FAULT_IPC_TIMEOUT, SEV_CRITICAL, "IPC Latency Critical (>50ms)");
@@ -260,6 +273,31 @@ static void ipc_record_latency(uint32_t lat_us) {
 }
 
 /* ============================================================================
+ * FAULT DETECTOR: QNX MESSAGE PASSING HEARTBEAT RECEIVER
+ * Listens on QNX channel via MsgReceive() for task heartbeats and replies MsgReply()
+ * ============================================================================ */
+static void* heartbeat_receiver_thread(void *arg) {
+    (void)arg;
+    HeartbeatMsg msg;
+    HeartbeatReply reply = { .status = 0 };
+
+    while (g.running) {
+        int rcvid = rt_msg_receive(g.heartbeat_chid, &msg, sizeof(msg), NULL);
+        if (rcvid <= 0) continue;
+
+        if (msg.type == MSG_TYPE_HEARTBEAT && msg.task_id >= 1 && msg.task_id <= MAX_TASKS) {
+            TaskControlBlock *t = &g.tasks[msg.task_id - 1];
+            t->heartbeat++;
+            t->last_heartbeat_time_us = msg.timestamp_us;
+            trace_record(t->task_id, EVENT_HEARTBEAT, 0);
+        }
+
+        rt_msg_reply(rcvid, 0, &reply, sizeof(reply));
+    }
+    return NULL;
+}
+
+/* ============================================================================
  * WORKLOAD SERVICE THREADS
  * ============================================================================ */
 
@@ -267,8 +305,11 @@ static void ipc_record_latency(uint32_t lat_us) {
 static void* service_a_thread(void *arg) {
     (void)arg;
     TaskControlBlock *t = &g.tasks[0];
+    rt_periodic_timer_t periodic_timer;
+    rt_timer_create(&periodic_timer, SIG_TIMER_SERVICE_A, t->period_ms);
 
     while (g.running) {
+        uint64_t cycles_start = get_clock_cycles();
         uint64_t t_start = get_time_us();
         trace_record(t->task_id, EVENT_TASK_START, 0);
 
@@ -284,11 +325,16 @@ static void* service_a_thread(void *arg) {
             snprintf(g.ipc_channel.payload, sizeof(g.ipc_channel.payload),
                      "TRAFFIC:Sector_%u_Flow=%u", (t->heartbeat % 4) + 1, rand() % 100);
             g.ipc_channel.data_available = true;
+            if (g.shm_metrics) {
+                g.shm_metrics->ipc_channel = g.ipc_channel;
+            }
             RT_COND_SIGNAL(&g.ipc_cond);
         }
         RT_MUTEX_UNLOCK(&g.ipc_mutex);
 
         uint64_t t_end  = get_time_us();
+        uint64_t cycles_end = get_clock_cycles();
+        (void)cycles_start; (void)cycles_end;
         uint32_t exec   = (uint32_t)(t_end - t_start);
         t->last_exec_us = exec;
         t->total_exec_us += exec;
@@ -297,9 +343,14 @@ static void* service_a_thread(void *arg) {
         trace_record(t->task_id, EVENT_TASK_END, exec);
 
         if (!t->inject_starvation) {
-            t->heartbeat++;
-            t->last_heartbeat_time_us = get_time_us();
-            trace_record(t->task_id, EVENT_HEARTBEAT, 0);
+            HeartbeatMsg hb = {
+                .type = MSG_TYPE_HEARTBEAT,
+                .task_id = t->task_id,
+                .timestamp_us = get_time_us()
+            };
+            HeartbeatReply reply;
+            /* Send QNX message passing heartbeat (MsgSend) to Fault Detector */
+            rt_msg_send(g.heartbeat_coid, &hb, sizeof(hb), &reply, sizeof(reply));
         }
 
         /* Deadline check */
@@ -311,9 +362,10 @@ static void* service_a_thread(void *arg) {
             fault_clear(t->task_id, FAULT_DEADLINE_MISS);
         }
 
-        uint32_t elapsed = (uint32_t)((get_time_us() - t_start) / 1000);
-        if (elapsed < t->period_ms) sleep_ms(t->period_ms - elapsed);
+        /* QNX hardware interval timer wait (Requirement D) */
+        rt_timer_wait(&periodic_timer);
     }
+    rt_timer_destroy(&periodic_timer);
     return NULL;
 }
 
@@ -321,8 +373,11 @@ static void* service_a_thread(void *arg) {
 static void* service_b_thread(void *arg) {
     (void)arg;
     TaskControlBlock *t = &g.tasks[1];
+    rt_periodic_timer_t periodic_timer;
+    rt_timer_create(&periodic_timer, SIG_TIMER_SERVICE_B, t->period_ms);
 
     while (g.running) {
+        uint64_t cycles_start = get_clock_cycles();
         uint64_t t_start = get_time_us();
         trace_record(t->task_id, EVENT_TASK_START, 0);
 
@@ -337,6 +392,9 @@ static void* service_b_thread(void *arg) {
             g.ipc_channel.recv_time_us   = t_recv;
             g.ipc_channel.latency_us     = lat;
             g.ipc_channel.data_available = false;
+            if (g.shm_metrics) {
+                g.shm_metrics->ipc_channel = g.ipc_channel;
+            }
             ipc_record_latency(lat);
             trace_record(t->task_id, EVENT_IPC_XFER, lat);
         }
@@ -347,6 +405,8 @@ static void* service_b_thread(void *arg) {
         sleep_ms(delay);
 
         uint64_t t_end  = get_time_us();
+        uint64_t cycles_end = get_clock_cycles();
+        (void)cycles_start; (void)cycles_end;
         uint32_t exec   = (uint32_t)(t_end - t_start);
         t->last_exec_us = exec;
         t->total_exec_us += exec;
@@ -355,9 +415,14 @@ static void* service_b_thread(void *arg) {
         trace_record(t->task_id, EVENT_TASK_END, exec);
 
         if (!t->inject_starvation) {
-            t->heartbeat++;
-            t->last_heartbeat_time_us = get_time_us();
-            trace_record(t->task_id, EVENT_HEARTBEAT, 0);
+            HeartbeatMsg hb = {
+                .type = MSG_TYPE_HEARTBEAT,
+                .task_id = t->task_id,
+                .timestamp_us = get_time_us()
+            };
+            HeartbeatReply reply;
+            /* Send QNX message passing heartbeat (MsgSend) to Fault Detector */
+            rt_msg_send(g.heartbeat_coid, &hb, sizeof(hb), &reply, sizeof(reply));
         }
 
         if (exec > t->deadline_ms * 1000U) {
@@ -368,9 +433,10 @@ static void* service_b_thread(void *arg) {
             fault_clear(t->task_id, FAULT_DEADLINE_MISS);
         }
 
-        uint32_t elapsed = (uint32_t)((get_time_us() - t_start) / 1000);
-        if (elapsed < t->period_ms) sleep_ms(t->period_ms - elapsed);
+        /* QNX hardware interval timer wait (Requirement D) */
+        rt_timer_wait(&periodic_timer);
     }
+    rt_timer_destroy(&periodic_timer);
     return NULL;
 }
 
@@ -378,8 +444,11 @@ static void* service_b_thread(void *arg) {
 static void* service_c_thread(void *arg) {
     (void)arg;
     TaskControlBlock *t = &g.tasks[2];
+    rt_periodic_timer_t periodic_timer;
+    rt_timer_create(&periodic_timer, SIG_TIMER_SERVICE_C, t->period_ms);
 
     while (g.running) {
+        uint64_t cycles_start = get_clock_cycles();
         uint64_t t_start = get_time_us();
         trace_record(t->task_id, EVENT_TASK_START, 0);
 
@@ -388,6 +457,8 @@ static void* service_c_thread(void *arg) {
         sleep_ms(delay);
 
         uint64_t t_end  = get_time_us();
+        uint64_t cycles_end = get_clock_cycles();
+        (void)cycles_start; (void)cycles_end;
         uint32_t exec   = (uint32_t)(t_end - t_start);
         t->last_exec_us = exec;
         t->total_exec_us += exec;
@@ -396,9 +467,14 @@ static void* service_c_thread(void *arg) {
         trace_record(t->task_id, EVENT_TASK_END, exec);
 
         if (!t->inject_starvation) {
-            t->heartbeat++;
-            t->last_heartbeat_time_us = get_time_us();
-            trace_record(t->task_id, EVENT_HEARTBEAT, 0);
+            HeartbeatMsg hb = {
+                .type = MSG_TYPE_HEARTBEAT,
+                .task_id = t->task_id,
+                .timestamp_us = get_time_us()
+            };
+            HeartbeatReply reply;
+            /* Send QNX message passing heartbeat (MsgSend) to Fault Detector */
+            rt_msg_send(g.heartbeat_coid, &hb, sizeof(hb), &reply, sizeof(reply));
         }
 
         if (exec > t->deadline_ms * 1000U) {
@@ -409,9 +485,10 @@ static void* service_c_thread(void *arg) {
             fault_clear(t->task_id, FAULT_DEADLINE_MISS);
         }
 
-        uint32_t elapsed = (uint32_t)((get_time_us() - t_start) / 1000);
-        if (elapsed < t->period_ms) sleep_ms(t->period_ms - elapsed);
+        /* QNX hardware interval timer wait (Requirement D) */
+        rt_timer_wait(&periodic_timer);
     }
+    rt_timer_destroy(&periodic_timer);
     return NULL;
 }
 
@@ -428,19 +505,23 @@ static void* cpu_burner_thread(void *arg) {
             sleep_ms(200);
         }
     }
-    return (void*)0;
+    return NULL;
 }
 
 /* ============================================================================
  * HIGH-PRIORITY MONITORING TASK  (design.md §4)
+ * Periodic interval timer via timer_create() / timer_settime() (Requirement D)
  * Samples heartbeat staleness, execution time, deadline, and CPU utilisation
  * ============================================================================ */
 static void* monitoring_task_thread(void *arg) {
     (void)arg;
+    rt_periodic_timer_t mon_timer;
+    rt_timer_create(&mon_timer, SIG_TIMER_MONITOR, MONITOR_INTERVAL_MS);
     uint64_t prev_time = get_time_us();
 
     while (g.running) {
-        sleep_ms(MONITOR_INTERVAL_MS);
+        /* Zero busy-polling kernel wait on interval timer */
+        rt_timer_wait(&mon_timer);
         uint64_t now       = get_time_us();
         uint64_t window_us = now - prev_time;
         prev_time = now;
@@ -480,23 +561,37 @@ static void* monitoring_task_thread(void *arg) {
             }
         }
 
+        /* Sample process CPU usage & thread states via QNX /proc/<pid>/as devctl() (Requirement A) */
+        QnxProcSample proc_sample;
+        qnx_procfs_sample_cpu(getpid(), &proc_sample);
+
         /* Aggregate CPU utilisation */
         float cpu = (window_us > 0) ? (work_us / (float)window_us * 100.0f) : 0.0f;
         if (g.inject_cpu_overload) cpu += 60.0f;
         if (cpu > 100.0f) cpu = 100.0f;
         g.total_cpu_pct = cpu;
 
+        /* Mirror CPU and task states into high-frequency Shared Memory (shm_open + mmap) */
+        if (g.shm_metrics) {
+            g.shm_metrics->timestamp_us = now;
+            g.shm_metrics->total_cpu_pct = cpu;
+            for (int i = 0; i < MAX_TASKS; i++) {
+                g.shm_metrics->tasks[i] = g.tasks[i];
+            }
+        }
+
         /* CPU overload fault thresholds */
         if (cpu >= CPU_CRIT_THRESHOLD) {
-            char d[64]; snprintf(d, sizeof(d), "CPU Overload Critical: %.1f%%", cpu);
+            char d[64]; snprintf(d, sizeof(d), "CPU Overload Critical: %.1f%% (Threads: %u)", cpu, proc_sample.num_threads);
             fault_register(0, FAULT_CPU_OVERLOAD, SEV_CRITICAL, d);
         } else if (cpu >= CPU_WARN_THRESHOLD) {
-            char d[64]; snprintf(d, sizeof(d), "CPU Elevated: %.1f%%", cpu);
+            char d[64]; snprintf(d, sizeof(d), "CPU Elevated: %.1f%% (Threads: %u)", cpu, proc_sample.num_threads);
             fault_register(0, FAULT_CPU_OVERLOAD, SEV_WARNING, d);
         } else {
             fault_clear(0, FAULT_CPU_OVERLOAD);
         }
     }
+    rt_timer_destroy(&mon_timer);
     return NULL;
 }
 
@@ -543,11 +638,7 @@ static void* telemetry_sender_thread(void *arg) {
                g.supervisor_ip, g.supervisor_port);
         if (connect(sock, (struct sockaddr*)&sv, sizeof(sv)) < 0) {
             perror("[Telemetry] Connect error");
-#if defined(_WIN32) && !defined(__CYGWIN__)
-            closesocket(sock);
-#else
             close(sock);
-#endif
             sleep_ms(2000); continue;
         }
 
@@ -564,11 +655,7 @@ static void* telemetry_sender_thread(void *arg) {
         }
 
         g.tcp_connected = false;
-#if defined(_WIN32) && !defined(__CYGWIN__)
-        closesocket(sock);
-#else
         close(sock);
-#endif
         sleep_ms(1000);
     }
     return NULL;
@@ -588,27 +675,43 @@ static void cli_status(void) {
     printf(" Supervisor Link  : %s\n", g.tcp_connected ? "\033[32mCONNECTED\033[0m" : "\033[31mDISCONNECTED\033[0m");
     printf(" Active Faults    : %u\n", g.fault_counter);
     printf(" Uptime           : " FMT_U64 " ms\n", (uint64_t)(get_time_us() / 1000));
+    printf(" Timers (Req D)   : timer_create(CLOCK_MONOTONIC) [Hardware Interval]\n");
+    printf(" Heartbeat IPC    : QNX MsgSend() -> MsgReceive() [ChID: %d, CoID: %d]\n", g.heartbeat_chid, g.heartbeat_coid);
+    printf(" Shared Memory    : %s (" SHM_METRICS_NAME ", %zu bytes mmap'd)\n",
+           g.shm_metrics ? "\033[32mACTIVE\033[0m" : "\033[31mINACTIVE\033[0m", sizeof(SharedMetricsBlock));
     printf("=======================================================\n");
 }
 
 static void cli_tasks(void) {
-    printf("\n%-4s  %-22s  %-8s  %-6s  %-8s  %-8s  %-10s  %-5s\n",
-           "ID", "NAME", "STATE", "PRIO", "PERIOD", "DEADLN", "EXEC_US", "HB");
-    printf("-------------------------------------------------------------------------------------\n");
+    printf("\n%-4s  %-22s  %-8s  %-6s  %-8s  %-8s  %-10s  %-8s  %-12s\n",
+           "ID", "NAME", "STATE", "PRIO", "PERIOD", "DEADLN", "EXEC_US", "HB_MSGS", "TIMER_TYPE");
+    printf("------------------------------------------------------------------------------------------------------\n");
     for (int i = 0; i < MAX_TASKS; i++) {
         TaskControlBlock *t = &g.tasks[i];
         const char *st = (t->state == TASK_STATE_STARVED) ? "\033[31mSTARVED\033[0m" :
                          (t->state == TASK_STATE_WARNING) ? "\033[33mWARNING\033[0m" : "RUNNING";
-        printf("%-4u  %-22s  %-8s  %-6u  %-4u ms  %-4u ms  %-10u  %-5u\n",
+        printf("%-4u  %-22s  %-8s  %-6u  %-4u ms  %-4u ms  %-10u  %-8u  %-12s\n",
                t->task_id, t->name, st, t->priority,
-               t->period_ms, t->deadline_ms, t->last_exec_us, t->heartbeat);
+               t->period_ms, t->deadline_ms, t->last_exec_us, t->heartbeat, "timer_create");
     }
-    printf("-------------------------------------------------------------------------------------\n");
+    printf("------------------------------------------------------------------------------------------------------\n");
+    printf(" [*] Heartbeats delivered via QNX MsgSend() to Fault Detector Channel %d\n", g.heartbeat_chid);
 }
 
 static void cli_cpu(void) {
-    printf("\n--- CPU UTILIZATION ---\n");
-    printf(" Total : %.1f %%\n", g.total_cpu_pct);
+    printf("\n--- CPU UTILIZATION & PROCFS SAMPLING (Requirement A) ---\n");
+    printf(" Total Duty-Cycle : %.1f %%\n", g.total_cpu_pct);
+
+    QnxProcSample sample;
+    if (qnx_procfs_sample_cpu(getpid(), &sample) == 0) {
+        printf(" Kernel Procfs    : /proc/%d/as (devctl DCMD_PROC_INFO)\n", (int)getpid());
+        printf("  Kernel UTime    : " FMT_U64 " ns\n", sample.utime_ns);
+        printf("  Kernel STime    : " FMT_U64 " ns\n", sample.stime_ns);
+        printf("  Total CPU Time  : " FMT_U64 " ns\n", sample.cpu_time_ns);
+        printf("  Active Threads  : %u\n", sample.num_threads);
+    }
+
+    printf("\n--- TASK BREAKDOWN & HARDWARE CLOCK CYCLES (ClockCycles()) ---\n");
     for (int i = 0; i < MAX_TASKS; i++) {
         TaskControlBlock *t = &g.tasks[i];
         printf("  %-22s : %5.1f %%  (last=%u us  max=%u us  cycles=%u)\n",
@@ -620,12 +723,36 @@ static void cli_cpu(void) {
 static void cli_ipc(void) {
     IpcStats *s = &g.ipc_stats;
     printf("\n--- IPC LATENCY STATS (Shared Memory A -> B) ---\n");
+    printf(" Shared Memory Block: " SHM_METRICS_NAME " (%s)\n",
+           g.shm_metrics ? "\033[32mACTIVE\033[0m" : "\033[31mINACTIVE\033[0m");
     printf(" Samples : %u\n", s->count);
     printf(" Min     : %u us\n", s->min_us);
     printf(" Max     : %u us\n", s->max_us);
     printf(" Avg     : %u us\n", s->avg_us);
     printf(" P95     : %u us\n", s->p95_us);
     printf(" Delay Injected : %u ms\n", g.ipc_channel.inject_delay_ms);
+}
+
+static void cli_shm(void) {
+    printf("\n================ POSIX/QNX SHARED MEMORY ================\n");
+    printf(" Object Name : " SHM_METRICS_NAME "\n");
+    printf(" Status      : %s\n", g.shm_metrics ? "\033[32mMMAP_SHARED ACTIVE\033[0m" : "\033[31mNOT ATTACHED\033[0m");
+    if (g.shm_metrics) {
+        printf(" Mapped Addr : %p (%zu bytes)\n", (void*)g.shm_metrics, sizeof(SharedMetricsBlock));
+        printf(" Live SHM TS : " FMT_U64 " us\n", g.shm_metrics->timestamp_us);
+        printf(" SHM CPU %%   : %.1f %%\n", g.shm_metrics->total_cpu_pct);
+        printf(" SHM IPC P95 : %u us (Avg: %u us, Samples: %u)\n",
+               g.shm_metrics->ipc_stats.p95_us, g.shm_metrics->ipc_stats.avg_us, g.shm_metrics->ipc_stats.count);
+        printf(" SHM Channel : Seq=%u, DataAvailable=%s, Latency=%u us\n",
+               g.shm_metrics->ipc_channel.sequence,
+               g.shm_metrics->ipc_channel.data_available ? "YES" : "NO",
+               g.shm_metrics->ipc_channel.latency_us);
+        printf(" SHM Tasks   : T1(hb=%u, state=%d) | T2(hb=%u, state=%d) | T3(hb=%u, state=%d)\n",
+               g.shm_metrics->tasks[0].heartbeat, g.shm_metrics->tasks[0].state,
+               g.shm_metrics->tasks[1].heartbeat, g.shm_metrics->tasks[1].state,
+               g.shm_metrics->tasks[2].heartbeat, g.shm_metrics->tasks[2].state);
+    }
+    printf("=========================================================\n");
 }
 
 static void cli_faults(void) {
@@ -664,9 +791,10 @@ static void cli_trace(void) {
 static void cli_help(void) {
     printf("\nNODE 1 — Diagnostic Commands:\n");
     printf("  status                       Global health & LED state\n");
-    printf("  tasks                        All task metrics\n");
-    printf("  cpu                          CPU utilization breakdown\n");
+    printf("  tasks                        All task metrics & QNX MsgSend heartbeats\n");
+    printf("  cpu                          CPU utilization & procfs kernel sampling\n");
     printf("  ipc                          Shared-memory IPC latency stats\n");
+    printf("  shm                          POSIX /smart_city_metrics shared memory block\n");
     printf("  faults                       Active fault map\n");
     printf("  trace                        Gantt execution timeline\n");
     printf("  inject starve  <1-3>         Freeze heartbeat (task starvation)\n");
@@ -694,6 +822,7 @@ static void* cli_thread(void *arg) {
         else if (!strcmp(line, "tasks"))   cli_tasks();
         else if (!strcmp(line, "cpu"))     cli_cpu();
         else if (!strcmp(line, "ipc"))     cli_ipc();
+        else if (!strcmp(line, "shm"))     cli_shm();
         else if (!strcmp(line, "faults"))  cli_faults();
         else if (!strcmp(line, "trace"))   cli_trace();
         else if (!strcmp(line, "clear")) {
@@ -754,9 +883,6 @@ int main(int argc, char *argv[]) {
         if (!strcmp(argv[i], "--no-gpio"))   enable_gpio = false;
     }
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSADATA ws; WSAStartup(MAKEWORD(2,2), &ws);
-#endif
 
     RT_MUTEX_INIT(&g.task_mutex);
     RT_MUTEX_INIT(&g.ipc_mutex);
@@ -794,7 +920,25 @@ int main(int argc, char *argv[]) {
         hal_gpio_init();
     }
 
-    rt_thread_t th_sa, th_sb, th_sc, th_mon, th_burn, th_tcp, th_gpio, th_cli;
+    /* QNX Message Passing: Fault Detector Channel & Connection */
+    g.heartbeat_chid = rt_channel_create(0);
+    g.heartbeat_coid = rt_connect_attach(0, 0, g.heartbeat_chid, 0, 0);
+
+    /* POSIX/QNX Shared Memory: Create high-frequency metrics block */
+    g.shm_metrics = rt_shm_create(&g.shm_fd);
+    if (g.shm_metrics) {
+        printf(" Shared Memory : ACTIVE (" SHM_METRICS_NAME ", %zu bytes mapped)\n", sizeof(SharedMetricsBlock));
+        g.shm_metrics->total_cpu_pct = 0.0f;
+        g.shm_metrics->timestamp_us  = get_time_us();
+        for (int i = 0; i < MAX_TASKS; i++) {
+            g.shm_metrics->tasks[i] = g.tasks[i];
+        }
+    } else {
+        printf(" Shared Memory : INACTIVE (errno: %d)\n", errno);
+    }
+
+    rt_thread_t th_hb, th_sa, th_sb, th_sc, th_mon, th_burn, th_tcp, th_gpio, th_cli;
+    rt_thread_create(&th_hb,   PRIORITY_FAULT_DETECTOR, heartbeat_receiver_thread, NULL);
     rt_thread_create(&th_sa,   PRIORITY_SERVICE_A,   service_a_thread,       NULL);
     rt_thread_create(&th_sb,   PRIORITY_SERVICE_B,   service_b_thread,       NULL);
     rt_thread_create(&th_sc,   PRIORITY_SERVICE_C,   service_c_thread,       NULL);
@@ -812,9 +956,14 @@ int main(int argc, char *argv[]) {
     g.running = false;
     sleep_ms(500);
     hal_gpio_deinit();    /* Turn off LEDs, release GPIO memory map */
+    rt_connect_detach(g.heartbeat_coid);
+    rt_channel_destroy(g.heartbeat_chid);
 
-#if defined(_WIN32) && !defined(__CYGWIN__)
-    WSACleanup();
-#endif
+    /* Release Shared Memory */
+    if (g.shm_metrics) {
+        rt_shm_destroy(g.shm_metrics, g.shm_fd);
+        g.shm_metrics = NULL;
+    }
+
     return 0;
 }

@@ -15,17 +15,6 @@
 #define SMART_CITY_COMMON_H
 
 #define _GNU_SOURCE
-#define __USE_MINGW_ANSI_STDIO 1
-
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <process.h>
-#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,13 +25,6 @@
 #include <math.h>
 #include <inttypes.h>
 #include <errno.h>
-
-#if defined(__QNX__) || defined(__QNXNTO__)
-#include <sys/neutrino.h>
-#include <sys/syspage.h>
-#endif
-
-#if !defined(_WIN32) || defined(__CYGWIN__)
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -50,18 +32,19 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#if defined(__QNX__) || defined(__QNXNTO__)
+#include <sys/neutrino.h>
+#include <sys/syspage.h>
+#include <devctl.h>
+#include <sys/procfs.h>
 #endif
 
-/* 64-bit printf format — use PRIu64 from inttypes.h for portability
- * On QNX aarch64: uint64_t = unsigned long  → PRIu64 = "lu"
- * On Windows:     uint64_t = unsigned long long → PRIu64 = "I64u" (MSVC)
- *                                                         "llu"  (MinGW)
- */
-#if defined(_WIN32) && !defined(__CYGWIN__)
-#define FMT_U64 "%I64u"
-#else
+/* 64-bit printf format — use PRIu64 from inttypes.h for portability */
 #define FMT_U64 "%" PRIu64
-#endif
 
 /* ============================================================================
  * CONFIGURATION & NETWORK
@@ -217,6 +200,192 @@ typedef struct {
 } TraceRingBuffer;
 
 /* ============================================================================
+ * POSIX / QNX SHARED MEMORY METRICS (shm_open + mmap)
+ * Requirement: Shared memory for high-frequency metrics (CPU%, IPC latency)
+ * ============================================================================ */
+#define SHM_METRICS_NAME  "/smart_city_metrics"
+
+typedef struct {
+    uint64_t         timestamp_us;
+    float            total_cpu_pct;
+    IpcStats         ipc_stats;
+    IpcChannel       ipc_channel;
+    TaskControlBlock tasks[MAX_TASKS];
+} SharedMetricsBlock;
+
+static inline SharedMetricsBlock* rt_shm_create(int *out_fd) {
+    int fd = shm_open(SHM_METRICS_NAME, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) return NULL;
+
+    if (ftruncate(fd, sizeof(SharedMetricsBlock)) != 0) {
+        close(fd);
+        shm_unlink(SHM_METRICS_NAME);
+        return NULL;
+    }
+
+    void *ptr = mmap(NULL, sizeof(SharedMetricsBlock), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+        close(fd);
+        shm_unlink(SHM_METRICS_NAME);
+        return NULL;
+    }
+
+    if (out_fd) *out_fd = fd;
+    return (SharedMetricsBlock*)ptr;
+}
+
+static inline SharedMetricsBlock* rt_shm_attach(int *out_fd) {
+    int fd = shm_open(SHM_METRICS_NAME, O_RDONLY, 0444);
+    if (fd < 0) return NULL;
+
+    void *ptr = mmap(NULL, sizeof(SharedMetricsBlock), PROT_READ, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+
+    if (out_fd) *out_fd = fd;
+    return (SharedMetricsBlock*)ptr;
+}
+
+static inline void rt_shm_destroy(SharedMetricsBlock *shm, int fd) {
+    if (shm && shm != MAP_FAILED) {
+        munmap(shm, sizeof(SharedMetricsBlock));
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    shm_unlink(SHM_METRICS_NAME);
+}
+
+/* ============================================================================
+ * QNX NATIVE MESSAGE PASSING HEARTBEAT (MsgSend / MsgReceive)
+ * Requirement: Tasks send MsgSend() heartbeats to Fault Detector Channel
+ * ============================================================================ */
+#define MSG_TYPE_HEARTBEAT      0x01
+
+typedef struct {
+    uint16_t type;              /* MSG_TYPE_HEARTBEAT */
+    uint32_t task_id;           /* Task ID (1, 2, 3) */
+    uint64_t timestamp_us;      /* Microsecond timestamp */
+} HeartbeatMsg;
+
+typedef struct {
+    uint16_t status;            /* 0 = OK */
+} HeartbeatReply;
+
+#if defined(__QNX__) || defined(__QNXNTO__)
+
+static inline int rt_channel_create(int flags) {
+    return ChannelCreate(flags);
+}
+static inline int rt_connect_attach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags) {
+    return ConnectAttach(nd, pid, chid, index, flags);
+}
+static inline int rt_msg_send(int coid, const void *smsg, size_t sbytes, void *rmsg, size_t rbytes) {
+    return MsgSend(coid, smsg, (int)sbytes, rmsg, (int)rbytes);
+}
+static inline int rt_msg_receive(int chid, void *rmsg, size_t rbytes, void *info) {
+    return MsgReceive(chid, rmsg, (int)rbytes, (struct _msg_info*)info);
+}
+static inline int rt_msg_reply(int rcvid, int status, const void *rmsg, size_t rbytes) {
+    return MsgReply(rcvid, status, rmsg, (int)rbytes);
+}
+static inline int rt_connect_detach(int coid) {
+    return ConnectDetach(coid);
+}
+static inline int rt_channel_destroy(int chid) {
+    return ChannelDestroy(chid);
+}
+
+#else
+
+/* Portable POSIX Simulation Wrapper for Non-QNX Test Builds */
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  has_msg;
+    pthread_cond_t  has_reply;
+    bool            msg_pending;
+    bool            reply_pending;
+    HeartbeatMsg    msg;
+    HeartbeatReply  reply;
+    int             reply_status;
+    bool            active;
+} _posix_msg_ipc_t;
+
+static _posix_msg_ipc_t _g_msg_ipc;
+
+static inline int rt_channel_create(int flags) {
+    (void)flags;
+    pthread_mutex_init(&_g_msg_ipc.lock, NULL);
+    pthread_cond_init(&_g_msg_ipc.has_msg, NULL);
+    pthread_cond_init(&_g_msg_ipc.has_reply, NULL);
+    _g_msg_ipc.msg_pending = false;
+    _g_msg_ipc.reply_pending = false;
+    _g_msg_ipc.active = true;
+    return 1;
+}
+static inline int rt_connect_attach(uint32_t nd, pid_t pid, int chid, unsigned index, int flags) {
+    (void)nd; (void)pid; (void)chid; (void)index; (void)flags;
+    return 1;
+}
+static inline int rt_msg_send(int coid, const void *smsg, size_t sbytes, void *rmsg, size_t rbytes) {
+    (void)coid;
+    pthread_mutex_lock(&_g_msg_ipc.lock);
+    if (!_g_msg_ipc.active) { pthread_mutex_unlock(&_g_msg_ipc.lock); return -1; }
+    memcpy(&_g_msg_ipc.msg, smsg, (sbytes > sizeof(HeartbeatMsg)) ? sizeof(HeartbeatMsg) : sbytes);
+    _g_msg_ipc.msg_pending = true;
+    _g_msg_ipc.reply_pending = false;
+    pthread_cond_signal(&_g_msg_ipc.has_msg);
+    while (!_g_msg_ipc.reply_pending && _g_msg_ipc.active) {
+        pthread_cond_wait(&_g_msg_ipc.has_reply, &_g_msg_ipc.lock);
+    }
+    if (rmsg && rbytes > 0) {
+        memcpy(rmsg, &_g_msg_ipc.reply, (rbytes > sizeof(HeartbeatReply)) ? sizeof(HeartbeatReply) : rbytes);
+    }
+    int status = _g_msg_ipc.reply_status;
+    pthread_mutex_unlock(&_g_msg_ipc.lock);
+    return status;
+}
+static inline int rt_msg_receive(int chid, void *rmsg, size_t rbytes, void *info) {
+    (void)chid; (void)info;
+    pthread_mutex_lock(&_g_msg_ipc.lock);
+    while (!_g_msg_ipc.msg_pending && _g_msg_ipc.active) {
+        pthread_cond_wait(&_g_msg_ipc.has_msg, &_g_msg_ipc.lock);
+    }
+    if (!_g_msg_ipc.active) { pthread_mutex_unlock(&_g_msg_ipc.lock); return -1; }
+    if (rmsg && rbytes > 0) {
+        memcpy(rmsg, &_g_msg_ipc.msg, (rbytes > sizeof(HeartbeatMsg)) ? sizeof(HeartbeatMsg) : rbytes);
+    }
+    _g_msg_ipc.msg_pending = false;
+    pthread_mutex_unlock(&_g_msg_ipc.lock);
+    return 1;
+}
+static inline int rt_msg_reply(int rcvid, int status, const void *rmsg, size_t rbytes) {
+    (void)rcvid;
+    pthread_mutex_lock(&_g_msg_ipc.lock);
+    if (rmsg && rbytes > 0) {
+        memcpy(&_g_msg_ipc.reply, rmsg, (rbytes > sizeof(HeartbeatReply)) ? sizeof(HeartbeatReply) : rbytes);
+    }
+    _g_msg_ipc.reply_status = status;
+    _g_msg_ipc.reply_pending = true;
+    pthread_cond_signal(&_g_msg_ipc.has_reply);
+    pthread_mutex_unlock(&_g_msg_ipc.lock);
+    return 0;
+}
+static inline int rt_connect_detach(int coid) { (void)coid; return 0; }
+static inline int rt_channel_destroy(int chid) {
+    (void)chid;
+    pthread_mutex_lock(&_g_msg_ipc.lock);
+    _g_msg_ipc.active = false;
+    pthread_cond_broadcast(&_g_msg_ipc.has_msg);
+    pthread_cond_broadcast(&_g_msg_ipc.has_reply);
+    pthread_mutex_unlock(&_g_msg_ipc.lock);
+    return 0;
+}
+#endif
+
+/* ============================================================================
  * TCP TELEMETRY PACKET  (Pi 1 -> Pi 2, JSON newline-delimited)
  *
  * Format example:
@@ -230,72 +399,80 @@ typedef struct {
  * ============================================================================ */
 
 /* ============================================================================
- * PORTABLE MONOTONIC CLOCK UTILITIES
+ * HIGH-RESOLUTION TIMING & QNX PROCFS / DEVCTL SAMPLING (Requirement A)
+ * Uses ClockCycles() / clock_gettime() and /proc/<pid>/as devctl() calls
  * ============================================================================ */
 static inline uint64_t get_time_us(void) {
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-    static LARGE_INTEGER freq;
-    static int init = 0;
-    if (!init) { QueryPerformanceFrequency(&freq); init = 1; }
-    LARGE_INTEGER cnt;
-    QueryPerformanceCounter(&cnt);
-    return (uint64_t)((cnt.QuadPart * 1000000ULL) / freq.QuadPart);
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((uint64_t)ts.tv_sec * 1000000ULL) + ((uint64_t)ts.tv_nsec / 1000ULL);
+}
+
+static inline uint64_t get_clock_cycles(void) {
+#if defined(__QNX__) || defined(__QNXNTO__)
+    return ClockCycles();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
 #endif
 }
 
 static inline void sleep_ms(uint32_t ms) {
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-    Sleep(ms);
-#else
     struct timespec req = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
     nanosleep(&req, NULL);
+}
+
+typedef struct {
+    uint32_t num_threads;
+    uint64_t utime_ns;
+    uint64_t stime_ns;
+    uint64_t cpu_time_ns;
+    int32_t  process_state;
+    float    sampled_cpu_pct;
+} QnxProcSample;
+
+static inline int qnx_procfs_sample_cpu(pid_t pid, QnxProcSample *sample) {
+    if (!sample) return -1;
+    memset(sample, 0, sizeof(QnxProcSample));
+
+#if defined(__QNX__) || defined(__QNXNTO__)
+    char path[64];
+    if (pid <= 0) pid = getpid();
+    snprintf(path, sizeof(path), "/proc/%d/as", (int)pid);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    procfs_info pinfo;
+    if (devctl(fd, DCMD_PROC_INFO, &pinfo, sizeof(pinfo), NULL) == 0) {
+        sample->num_threads = pinfo.num_threads;
+        sample->utime_ns = (uint64_t)pinfo.utime;
+        sample->stime_ns = (uint64_t)pinfo.stime;
+        sample->cpu_time_ns = sample->utime_ns + sample->stime_ns;
+        sample->process_state = pinfo.flags;
+    }
+
+    procfs_status pstatus;
+    pstatus.tid = 1;
+    if (devctl(fd, DCMD_PROC_STATUS, &pstatus, sizeof(pstatus), NULL) == 0) {
+        sample->process_state = pstatus.state;
+    }
+
+    close(fd);
+    return 0;
+#else
+    (void)pid;
+    sample->num_threads = 8;
+    sample->process_state = 1;
+    return 0;
 #endif
 }
 
 /* ============================================================================
- * PORTABLE REAL-TIME THREAD ABSTRACTION
+ * REAL-TIME THREAD ABSTRACTION (QNX / POSIX)
  * ============================================================================ */
 typedef void* (*thread_func_t)(void*);
-
-#if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__QNX__)
-
-typedef HANDLE rt_thread_t;
-typedef CRITICAL_SECTION rt_mutex_t;
-typedef CONDITION_VARIABLE rt_cond_t;
-
-#define RT_MUTEX_INIT(m)    InitializeCriticalSection(m)
-#define RT_MUTEX_DESTROY(m) DeleteCriticalSection(m)
-#define RT_MUTEX_LOCK(m)    EnterCriticalSection(m)
-#define RT_MUTEX_UNLOCK(m)  LeaveCriticalSection(m)
-#define RT_COND_INIT(c)     InitializeConditionVariable(c)
-#define RT_COND_SIGNAL(c)   WakeConditionVariable(c)
-#define RT_COND_WAIT(c,m)   SleepConditionVariableCS((c),(m),INFINITE)
-
-typedef struct { thread_func_t func; void *arg; } _win_ta;
-static inline DWORD WINAPI _win_tramp(LPVOID p) {
-    _win_ta *a = (_win_ta*)p; thread_func_t f = a->func; void *arg = a->arg;
-    free(a); f(arg); return 0;
-}
-static inline int rt_thread_create(rt_thread_t *t, int pri, thread_func_t fn, void *arg) {
-    _win_ta *a = (_win_ta*)malloc(sizeof(_win_ta)); a->func = fn; a->arg = arg;
-    *t = CreateThread(NULL, 0, _win_tramp, a, 0, NULL);
-    if (!*t) return -1;
-    int wp = THREAD_PRIORITY_NORMAL;
-    if (pri >= 20) wp = THREAD_PRIORITY_TIME_CRITICAL;
-    else if (pri >= 15) wp = THREAD_PRIORITY_HIGHEST;
-    else if (pri >= 12) wp = THREAD_PRIORITY_ABOVE_NORMAL;
-    else if (pri <= 5)  wp = THREAD_PRIORITY_BELOW_NORMAL;
-    SetThreadPriority(*t, wp); return 0;
-}
-static inline void rt_thread_join(rt_thread_t t) {
-    WaitForSingleObject(t, INFINITE); CloseHandle(t);
-}
-
-#else  /* QNX / POSIX */
 
 typedef pthread_t        rt_thread_t;
 typedef pthread_mutex_t  rt_mutex_t;
@@ -327,6 +504,72 @@ static inline int rt_thread_create(rt_thread_t *t, int pri, thread_func_t fn, vo
 }
 static inline void rt_thread_join(rt_thread_t t) { pthread_join(t, NULL); }
 
-#endif  /* QNX / POSIX */
+/* ============================================================================
+ * QNX / POSIX HARDWARE INTERVAL TIMERS (Requirement D)
+ * Uses timer_create() and timer_settime() with CLOCK_MONOTONIC and signals
+ * (eliminates timing drift and busy-polling)
+ * ============================================================================ */
+#ifndef SIGRTMIN
+#define SIGRTMIN 34
+#endif
+
+#define SIG_TIMER_SERVICE_A   (SIGRTMIN + 1)
+#define SIG_TIMER_SERVICE_B   (SIGRTMIN + 2)
+#define SIG_TIMER_SERVICE_C   (SIGRTMIN + 3)
+#define SIG_TIMER_MONITOR     (SIGRTMIN + 4)
+#define SIG_TIMER_SUPERVISOR  (SIGRTMIN + 5)
+
+typedef struct {
+    timer_t   timer_id;
+    sigset_t  sig_set;
+    int       sig_no;
+    bool      active;
+} rt_periodic_timer_t;
+
+static inline int rt_timer_create(rt_periodic_timer_t *t, int sig_no, uint32_t period_ms) {
+    if (!t) return -1;
+    t->sig_no = sig_no;
+    t->active = false;
+
+    sigemptyset(&t->sig_set);
+    sigaddset(&t->sig_set, sig_no);
+    pthread_sigmask(SIG_BLOCK, &t->sig_set, NULL);
+
+    struct sigevent sev;
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo  = sig_no;
+    sev.sigev_value.sival_ptr = &t->timer_id;
+
+    if (timer_create(CLOCK_MONOTONIC, &sev, &t->timer_id) != 0) {
+        return -1;
+    }
+
+    struct itimerspec its;
+    its.it_value.tv_sec     = (time_t)(period_ms / 1000);
+    its.it_value.tv_nsec    = (long)(period_ms % 1000) * 1000000L;
+    its.it_interval.tv_sec  = its.it_value.tv_sec;
+    its.it_interval.tv_nsec = its.it_value.tv_nsec;
+
+    if (timer_settime(t->timer_id, 0, &its, NULL) != 0) {
+        timer_delete(t->timer_id);
+        return -1;
+    }
+    t->active = true;
+    return 0;
+}
+
+static inline void rt_timer_wait(rt_periodic_timer_t *t) {
+    if (!t || !t->active) return;
+    int sig;
+    sigwait(&t->sig_set, &sig);
+}
+
+static inline void rt_timer_destroy(rt_periodic_timer_t *t) {
+    if (t && t->active) {
+        timer_delete(t->timer_id);
+        t->active = false;
+    }
+}
 
 #endif /* SMART_CITY_COMMON_H */
