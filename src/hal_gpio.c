@@ -60,7 +60,7 @@
 
 /* BCM2711 (RPi 4) GPIO peripheral base */
 #define BCM2711_GPIO_BASE   0xFE200000UL
-#define GPIO_REG_SIZE       0xB4
+#define GPIO_REG_SIZE       0x100 /* 256 bytes to cover BCM2711 pull-up regs up to 0xF4 */
 
 /* GPIO register offsets */
 #define GPFSEL0     0x00
@@ -71,6 +71,12 @@
 #define GPLEV0      0x34
 #define GPPUD       0x94
 #define GPPUDCLK0   0x98
+
+/* BCM2711 (RPi 4) Pull-up / Pull-down control registers */
+#define GPPUPPDN0   0xE4    /* GPIO 0-15 */
+#define GPPUPPDN1   0xE8    /* GPIO 16-31 */
+#define GPPUPPDN2   0xEC    /* GPIO 32-47 */
+#define GPPUPPDN3   0xF0    /* GPIO 48-57 */
 
 /* ============================================================================
  * BUTTON CALLBACK TYPE
@@ -125,7 +131,15 @@ static void gpio_set_input_pullup(int pin) {
     val &= ~(7U << bit);   /* 000 = input */
     gpio_write(offset, val);
 
-    /* Enable pull-up via GPPUD sequence */
+    /* BCM2711 (RPi 4) pull-up: 2 bits per pin (00=None, 01=PullUp, 10=PullDown) */
+    uint32_t pup_offset = GPPUPPDN0 + ((pin / 16) * 4);
+    int pup_shift = (pin % 16) * 2;
+    uint32_t pup_val = gpio_read(pup_offset);
+    pup_val &= ~(3U << pup_shift);
+    pup_val |=  (1U << pup_shift); /* 1 = Pull Up */
+    gpio_write(pup_offset, pup_val);
+
+    /* Legacy BCM2835 pull-up sequence fallback */
     gpio_write(GPPUD, 2);          /* 2 = pull-up */
     sleep_ms(1);
     gpio_write(GPPUDCLK0, 1U << pin);
@@ -162,10 +176,13 @@ int hal_gpio_init(void) {
     gpio_set_input_pullup(GPIO_BTN_2);
     gpio_set_input_pullup(GPIO_BTN_3);
 
-    /* Initialize previous levels as HIGH (not pressed) */
-    gpio_ctx.prev_level[0] = 1;
-    gpio_ctx.prev_level[1] = 1;
-    gpio_ctx.prev_level[2] = 1;
+    /* Allow pull-up resistors to stabilize */
+    sleep_ms(10);
+
+    /* Read actual initial levels so startup doesn't trigger false-positive edge detection */
+    gpio_ctx.prev_level[0] = gpio_pin_read(GPIO_BTN_1);
+    gpio_ctx.prev_level[1] = gpio_pin_read(GPIO_BTN_2);
+    gpio_ctx.prev_level[2] = gpio_pin_read(GPIO_BTN_3);
 
     gpio_ctx.initialized = true;
     printf("[GPIO] Hardware ready. LEDs: G=%d Y=%d R=%d | Buttons: %d %d %d\n",

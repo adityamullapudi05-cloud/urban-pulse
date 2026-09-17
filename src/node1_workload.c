@@ -542,6 +542,7 @@ static void* telemetry_sender_thread(void *arg) {
         printf("[Telemetry] Connecting to Supervisor %s:%d ...\n",
                g.supervisor_ip, g.supervisor_port);
         if (connect(sock, (struct sockaddr*)&sv, sizeof(sv)) < 0) {
+            perror("[Telemetry] Connect error");
 #if defined(_WIN32) && !defined(__CYGWIN__)
             closesocket(sock);
 #else
@@ -744,11 +745,13 @@ int main(int argc, char *argv[]) {
     g.node_id       = 1;
     g.led_state     = LED_GREEN;
     g.supervisor_port = TELEMETRY_PORT;
-    strncpy(g.supervisor_ip, "192.168.1.2", sizeof(g.supervisor_ip) - 1); /* Default Pi 2 IP */
+    strncpy(g.supervisor_ip, "169.254.178.16", sizeof(g.supervisor_ip) - 1); /* Default Pi 2 IP */
 
+    bool enable_gpio = true;
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--ip=", 5))   strncpy(g.supervisor_ip, argv[i]+5, sizeof(g.supervisor_ip)-1);
         if (!strncmp(argv[i], "--port=", 7)) g.supervisor_port = atoi(argv[i]+7);
+        if (!strcmp(argv[i], "--no-gpio"))   enable_gpio = false;
     }
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
@@ -783,10 +786,13 @@ int main(int argc, char *argv[]) {
     printf("===============================================================\n");
     printf(" %s — NODE 1 (Workload Node)\n", PLATFORM_NAME);
     printf(" Supervisor IP : %s:%d\n", g.supervisor_ip, g.supervisor_port);
+    printf(" GPIO Enabled  : %s\n", enable_gpio ? "YES (BCM2711 direct I/O)" : "NO (--no-gpio)");
     printf("===============================================================\n");
 
-    /* Initialize GPIO hardware (LEDs + input buttons) */
-    hal_gpio_init();
+    /* Initialize GPIO hardware (LEDs + input buttons) if enabled */
+    if (enable_gpio) {
+        hal_gpio_init();
+    }
 
     rt_thread_t th_sa, th_sb, th_sc, th_mon, th_burn, th_tcp, th_gpio, th_cli;
     rt_thread_create(&th_sa,   PRIORITY_SERVICE_A,   service_a_thread,       NULL);
@@ -795,9 +801,11 @@ int main(int argc, char *argv[]) {
     rt_thread_create(&th_mon,  PRIORITY_MONITOR,     monitoring_task_thread, NULL);
     rt_thread_create(&th_burn, PRIORITY_CLI,         cpu_burner_thread,      NULL);
     rt_thread_create(&th_tcp,  PRIORITY_TELEMETRY,   telemetry_sender_thread, NULL);
-    /* GPIO button polling thread — triggers gpio_button_callback() on FALLING EDGE */
-    rt_thread_create(&th_gpio, PRIORITY_FAULT_DETECTOR, hal_gpio_poll_thread,
-                     (void*)gpio_button_callback);
+    if (enable_gpio) {
+        /* GPIO button polling thread — triggers gpio_button_callback() on change */
+        rt_thread_create(&th_gpio, PRIORITY_FAULT_DETECTOR, hal_gpio_poll_thread,
+                         (void*)gpio_button_callback);
+    }
     rt_thread_create(&th_cli,  PRIORITY_CLI,         cli_thread,             NULL);
 
     rt_thread_join(th_cli);

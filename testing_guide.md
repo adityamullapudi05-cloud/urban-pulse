@@ -144,6 +144,9 @@ su -
 cd ~/tmp
 ./node2_supervisor
 
+# Or if running without physical push-buttons wired to GPIO pins 16/18/22:
+./node2_supervisor --no-gpio
+
 # Or with custom port
 ./node2_supervisor --port=5555
 ```
@@ -156,6 +159,9 @@ ssh -m hmac-sha2-256-etm@openssh.com qnxuser@192.168.1.1
 su -
 cd ~/tmp
 ./node1_workload --ip=192.168.1.2
+
+# Or if running without physical push-buttons wired:
+./node1_workload --ip=192.168.1.2 --no-gpio
 
 # Or with custom port
 ./node1_workload --ip=192.168.1.2 --port=5555
@@ -188,11 +194,11 @@ cd ~/tmp
 | Command   | Description                                      |
 |-----------|--------------------------------------------------|
 | help      | Show all available commands                      |
-| status    | Supervisor health, LED, Node 1 link              |
-| nodes     | Node connectivity overview                       |
-| tasks     | Remote mirror of Node 1 task states              |
-| cpu       | CPU analytics Min/Max/Avg/P95                    |
-| ipc       | IPC latency received from Node 1                 |
+| status    | Supervisor health, LED, Node 2 CPU & Node 1 CPU, packets rx |
+| nodes     | Node connectivity overview, packet age & total rx count      |
+| tasks     | Dual-node registry: Node 2 local threads + Node 1 tasks mirror |
+| cpu       | Dual-node CPU analytics (Node 2 load & Node 1 Min/Max/Avg/P95) |
+| ipc       | IPC latency received from Node 1                             |
 | faults    | Active fault map (all nodes and tasks)           |
 | faultmap  | Full fault hierarchy (node/task tree)            |
 | clear     | Clear all active faults                          |

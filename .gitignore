@@ -46,3 +46,8 @@ core.*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+*.xlsx
+
+test-results.xlsx
+*.html
