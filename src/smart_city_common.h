@@ -4,10 +4,10 @@
  * Smart City RTOS Fault & Performance Monitoring Platform
  *
  * Shared definitions between:
- *   node1_workload.c  - Raspberry Pi 1 (Monitored Workload Node)
- *   node2_supervisor.c - Raspberry Pi 2 (Supervisor / Analytics Node)
+ *   node1.c       - Raspberry Pi 1 (Monitored Workload Node)
+ *   supervisor.c  - Raspberry Pi 2 (Supervisor / Analytics Node)
  *
- * Target: QNX Neutrino RTOS on Raspberry Pi 4/5
+ * Target: Raspberry Pi 4
  * ============================================================================
  */
 
@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>
+#include <sys/time.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -49,7 +51,7 @@
 /* ============================================================================
  * CONFIGURATION & NETWORK
  * ============================================================================ */
-#define PLATFORM_NAME          "UrbanPulse-QNX-v2.0"
+#define PLATFORM_NAME          "Smart City RTOS Fault & Performance Monitoring Platform"
 #define TELEMETRY_PORT         5555        /* TCP port Pi1 -> Pi2 */
 #define TELEMETRY_INTERVAL_MS  500         /* Send every 500 ms */
 #define MONITOR_INTERVAL_MS    100         /* Monitoring task period */
@@ -59,7 +61,7 @@
 #define MAX_ACTIVE_FAULTS      16
 
 /* ============================================================================
- * REAL-TIME PRIORITY HIERARCHY  (conforming to design.md §4)
+ * REAL-TIME PRIORITY HIERARCHY 
  * Higher number = Higher priority in QNX SCHED_FIFO
  * ============================================================================ */
 #define PRIORITY_FAULT_DETECTOR  25   /* Highest: Safety-critical fault engine */
@@ -71,12 +73,12 @@
 #define PRIORITY_CLI              5   /* Low:    UART / Diagnostic CLI         */
 
 /* ============================================================================
- * FAULT THRESHOLDS  (conforming to design.md §5, §7, §12)
+ * FAULT THRESHOLDS 
  * ============================================================================ */
 #define CPU_WARN_THRESHOLD       70.0f    /* % */
 #define CPU_CRIT_THRESHOLD       85.0f    /* % */
-#define IPC_WARN_LATENCY_US      1000U    /* 1 ms  */
-#define IPC_CRIT_LATENCY_US      50000U   /* 50 ms */
+#define IPC_WARN_LATENCY_US      220000U   /* 220 ms (> 200 ms Service B period) */
+#define IPC_CRIT_LATENCY_US      300000U   /* 300 ms (critical queue stall)      */
 
 /* ============================================================================
  * ENUMERATIONS
@@ -526,6 +528,17 @@ typedef struct {
     bool      active;
 } rt_periodic_timer_t;
 
+static inline void rt_timers_block_signals(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIG_TIMER_SERVICE_A);
+    sigaddset(&set, SIG_TIMER_SERVICE_B);
+    sigaddset(&set, SIG_TIMER_SERVICE_C);
+    sigaddset(&set, SIG_TIMER_MONITOR);
+    sigaddset(&set, SIG_TIMER_SUPERVISOR);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+}
+
 static inline int rt_timer_create(rt_periodic_timer_t *t, int sig_no, uint32_t period_ms) {
     if (!t) return -1;
     t->sig_no = sig_no;
@@ -537,8 +550,8 @@ static inline int rt_timer_create(rt_periodic_timer_t *t, int sig_no, uint32_t p
 
     struct sigevent sev;
     memset(&sev, 0, sizeof(sev));
-    sev.sigev_notify = SIGEV_SIGNAL;
-    sev.sigev_signo  = sig_no;
+    sev.sigev_notify          = SIGEV_SIGNAL;
+    sev.sigev_signo           = sig_no;
     sev.sigev_value.sival_ptr = &t->timer_id;
 
     if (timer_create(CLOCK_MONOTONIC, &sev, &t->timer_id) != 0) {

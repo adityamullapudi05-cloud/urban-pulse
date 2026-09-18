@@ -2,10 +2,10 @@
  * ============================================================================
  * Smart City RTOS Fault & Performance Monitoring Platform
  * 
- * Target: QNX Neutrino RTOS (Raspberry Pi 4/5 Cluster) & Standard POSIX
- * Architecture: Distributed 2-Node (Workload Node & Supervisor Node)
+ * Target: Raspberry Pi 4/5 Cluster
+ * Architecture: Distributed 2-Node (Node1 & Supervisor Node)
  * 
- * Conforms to: design.md
+ * Description :
  *  - 3 Periodic Services (Service A: 100ms/80ms, Service B: 200ms/150ms, Service C: 500ms/400ms)
  *  - High-Priority Monitoring Task (100ms cycle, Heartbeat, Deadline, CPU Usage)
  *  - Shared Memory IPC Latency Tracking (Min, Max, Avg, P95)
@@ -98,7 +98,7 @@ static inline void rt_thread_join(rt_thread_t thread) {
 #define IPC_HISTORY_SIZE            100
 #define MAX_ACTIVE_FAULTS           16
 
-/* Real-Time Priority Hierarchy conforming to design.md */
+/* Real-Time Priority Hierarchy */
 #define PRIORITY_FAULT_DETECTOR     25  /* Highest: Fault safety */
 #define PRIORITY_MONITOR            20  /* High: Sampling & metrics */
 #define PRIORITY_SERVICE_A          15  /* Medium: Smart Traffic */
@@ -107,7 +107,7 @@ static inline void rt_thread_join(rt_thread_t thread) {
 #define PRIORITY_TELEMETRY          10  /* Normal: TCP Telemetry */
 #define PRIORITY_CLI                5   /* Low: UART / CLI Diagnostics */
 
-/* Thresholds conforming to design.md */
+/* Thresholds */
 #define HEARTBEAT_WARN_CYCLES       2
 #define HEARTBEAT_FAULT_CYCLES      3
 #define CPU_WARN_THRESHOLD          70.0f
@@ -1082,7 +1082,7 @@ static void init_system(NodeMode mode, const char* peer_ip, int peer_port) {
     RT_MUTEX_INIT(&g_sys.trace_buf.lock);
     RT_COND_INIT(&g_sys.ipc_cond);
 
-    /* Task TCBs conforming to design.md Section 3 */
+    /* Task TCBs  */
     /* Service A */
     g_sys.tasks[0].task_id = 1;
     strncpy(g_sys.tasks[0].name, "Service_A (Traffic)", sizeof(g_sys.tasks[0].name) - 1);

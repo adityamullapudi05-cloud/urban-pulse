@@ -34,9 +34,6 @@
  *   GPIO 27 (Pin 13) → Yellow LED = WARNING
  *   GPIO 22 (Pin 15) → Red    LED = CRITICAL FAULT
  *
- * WIRING:
- *   - All button pins use internal PULL-UP → HIGH by default (NORMAL)
- *   - Touch pin to any GND pin (e.g. Pin 6, 9, 14, 20, 25, 30, 34, 39)
  *   - Pin goes LOW while contact is held → fault active during contact only
  *   - Release → pin goes HIGH → fault auto-clears → normal state
  * ============================================================================
@@ -219,31 +216,26 @@ void hal_gpio_set_led(HealthLedState state) {
  */
 void* hal_gpio_poll_thread(void *arg) {
     if (!gpio_ctx.initialized) {
-        printf("[GPIO] Hardware not initialized (run as root for GPIO access). Polling disabled.\n");
+        printf("Hardware not initialized (run as root for GPIO access). Polling disabled.\n");
         return NULL;
     }
     gpio_callback_t cb = (gpio_callback_t)arg;
     int pins[3] = { GPIO_BTN_1, GPIO_BTN_2, GPIO_BTN_3 };
 
-    printf("[GPIO] Level-based fault injection monitoring active.\n");
-    printf("[GPIO]   Pin 16 (GPIO 23) → hold to GND = fault ON, release = NORMAL\n");
-    printf("[GPIO]   Pin 18 (GPIO 24) → hold to GND = fault ON, release = NORMAL\n");
-    printf("[GPIO]   Pin 22 (GPIO 25) → hold to GND = fault ON, release = NORMAL\n");
+    printf("Hardware button polling thread active (50ms debounce).\n");
 
     while (1) {
         for (int i = 0; i < 3; i++) {
             int level = gpio_pin_read(pins[i]);
 
             if (level != gpio_ctx.prev_level[i]) {
-                /* Level changed — fire callback with new pressed state */
+                /* Level changed — fire application callback with button ID and state */
                 bool pressed = (level == 0);  /* LOW = pressed (GND contact) */
-                printf("[GPIO] Pin GPIO %d → %s\n", pins[i],
-                       pressed ? "GND TOUCHED  (Fault ACTIVE)" : "RELEASED     (Returning to NORMAL)");
                 if (cb) cb(i, pressed);
                 gpio_ctx.prev_level[i] = level;
             }
         }
-        sleep_ms(20);  /* 20ms debounce polling interval */
+        sleep_ms(50);  /* 50ms debounce polling interval */
     }
     return NULL;
 }
@@ -255,7 +247,7 @@ void hal_gpio_deinit(void) {
     gpio_pin_clr(GPIO_LED_RED);
     munmap_device_io(gpio_ctx.gpio_base, GPIO_REG_SIZE);
     gpio_ctx.initialized = false;
-    printf("[GPIO] Hardware released.\n");
+    printf("Buttons Hardware released.\n");
 }
 
 /* ============================================================================
@@ -268,7 +260,7 @@ int hal_gpio_init(void) {
     gpio_ctx.prev_level[1] = 1;
     gpio_ctx.prev_level[2] = 1;
     gpio_ctx.initialized = true;
-    printf("[GPIO] SIMULATION MODE — no QNX hardware. Use CLI inject commands.\n");
+    printf("PRACTICAL SIMULATION MODE — no QNX hardware. Use CLI inject commands.\n");
     return 0;
 }
 

@@ -6,7 +6,7 @@
  * Build in QNX Momentics IDE  →  Deploy to Raspberry Pi 2
  * Run:  ./node2_supervisor  (optionally --port=5555)
  *
- * What this node does (design.md §2, §11-§16):
+ * Description :
  *   - TCP Telemetry Server (listens for Pi 1 JSON telemetry on port 5555)
  *   - Fault Detection Engine: Heartbeat, Deadline, CPU, IPC, Node-disconnect
  *   - Analytics Engine: Min / Max / Avg / P95 for CPU and IPC metrics
@@ -71,6 +71,11 @@ typedef struct {
     bool     node1_connected;
     uint64_t node1_last_rx_us;
 
+    /* Hardware button simulation flags */
+    bool sim_disconnect;
+    bool sim_ipc_timeout;
+    bool sim_cpu_overload;
+
     /* Analytics mutex */
     rt_mutex_t analytics_mutex;
 } Node2Context;
@@ -115,44 +120,44 @@ static void fault_clear(uint32_t node_id, uint32_t task_id, FaultType type);
 static void gpio_button_callback(int btn_id, bool pressed) {
     switch (btn_id) {
 
-        case 0:  /* GPIO 23 — Simulate Node 1 Disconnection */
+        case 0:  /* Pin 16 / GPIO 23 — Simulate Node 1 Disconnection */
+            g.sim_disconnect = pressed;
             if (pressed) {
                 g.node1_connected = false;
                 fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL,
-                               "[GPIO] Node1 disconnect simulated via Pin 16");
-                printf("\n[GPIO] Pin 16 → GND HELD   : NODE 1 DISCONNECTED (simulated)\n");
-                printf("                               Red LED ON — check supervisor> faultmap\n");
+                               "[GPIO] Node1 disconnect simulated via Button 1");
+                printf("\n[SUPERVISOR] [Node 1 Disconnect Simulation] → PRESSED  (Link lost → Red LED ON)\n");
             } else {
                 g.node1_connected = true;
                 g.node1_last_rx_us = get_time_us();
                 fault_clear(1, 0, FAULT_NODE_DISCONNECTED);
-                printf("\n[GPIO] Pin 16 → RELEASED   : Node 1 RECONNECTED — fault cleared, NORMAL\n");
+                printf("\n[SUPERVISOR] [Node 1 Disconnect Simulation] → RELEASED (Link restored → Green LED)\n");
             }
             printf("supervisor> "); fflush(stdout);
             break;
 
-        case 1:  /* GPIO 24 — Simulate IPC Timeout */
+        case 1:  /* Pin 18 / GPIO 24 — Simulate IPC Timeout */
+            g.sim_ipc_timeout = pressed;
             if (pressed) {
                 fault_register(1, 2, FAULT_IPC_TIMEOUT, SEV_CRITICAL,
-                               "[GPIO] IPC timeout simulated via Pin 18");
-                printf("\n[GPIO] Pin 18 → GND HELD   : IPC TIMEOUT active (simulated)\n");
-                printf("                               Yellow/Red LED ON while contact is held\n");
+                               "[GPIO] IPC timeout simulated via Button 2");
+                printf("\n[SUPERVISOR] [IPC Timeout Simulation]       → PRESSED  (Critical Fault → Red LED ON)\n");
             } else {
                 fault_clear(1, 2, FAULT_IPC_TIMEOUT);
-                printf("\n[GPIO] Pin 18 → RELEASED   : IPC timeout CLEARED — returning to NORMAL\n");
+                printf("\n[SUPERVISOR] [IPC Timeout Simulation]       → RELEASED (Fault Cleared → Green LED)\n");
             }
             printf("supervisor> "); fflush(stdout);
             break;
 
-        case 2:  /* GPIO 25 — Simulate CPU Overload */
+        case 2:  /* Pin 22 / GPIO 25 — Simulate CPU Overload */
+            g.sim_cpu_overload = pressed;
             if (pressed) {
                 fault_register(1, 0, FAULT_CPU_OVERLOAD, SEV_WARNING,
-                               "[GPIO] CPU overload simulated via Pin 22");
-                printf("\n[GPIO] Pin 22 → GND HELD   : CPU OVERLOAD WARNING active (simulated)\n");
-                printf("                               Yellow LED ON while contact is held\n");
+                               "[GPIO] CPU overload simulated via Button 3");
+                printf("\n[SUPERVISOR] [CPU Overload Warning]        → PRESSED  (Warning Active → Yellow LED ON)\n");
             } else {
                 fault_clear(1, 0, FAULT_CPU_OVERLOAD);
-                printf("\n[GPIO] Pin 22 → RELEASED   : CPU overload CLEARED — returning to NORMAL\n");
+                printf("\n[SUPERVISOR] [CPU Overload Warning]        → RELEASED (Fault Cleared → Green LED)\n");
             }
             printf("supervisor> "); fflush(stdout);
             break;
@@ -213,6 +218,9 @@ static void fault_clear(uint32_t node_id, uint32_t task_id, FaultType type) {
             if (g.fault_map[i].severity == SEV_WARNING)  has_warn = true;
         }
     }
+    if (g.remote_led == LED_RED)         has_crit = true;
+    else if (g.remote_led == LED_YELLOW) has_warn = true;
+
     if      (has_crit) hal_set_led(LED_RED);
     else if (has_warn) hal_set_led(LED_YELLOW);
     else               hal_set_led(LED_GREEN);
@@ -222,6 +230,9 @@ static void fault_clear(uint32_t node_id, uint32_t task_id, FaultType type) {
 static void fault_clear_all(void) {
     RT_MUTEX_LOCK(&g.fault_mutex);
     for (int i = 0; i < MAX_ACTIVE_FAULTS; i++) g.fault_map[i].active = false;
+    g.sim_disconnect   = false;
+    g.sim_ipc_timeout  = false;
+    g.sim_cpu_overload = false;
     hal_set_led(LED_GREEN);
     RT_MUTEX_UNLOCK(&g.fault_mutex);
 }
@@ -289,13 +300,14 @@ static void analytics_update_cpu(float cpu) {
 
 /* ============================================================================
  * FAULT DETECTOR ENGINE — Evaluates received telemetry for fault conditions
- * design.md §11, §12
  * ============================================================================ */
 static void fault_detector_evaluate(void) {
     float cpu = g.remote_cpu_pct;
 
     /* CPU overload faults */
-    if (cpu >= CPU_CRIT_THRESHOLD) {
+    if (g.sim_cpu_overload) {
+        fault_register(1, 0, FAULT_CPU_OVERLOAD, SEV_WARNING, "[GPIO] CPU overload simulated via Pin 22");
+    } else if (cpu >= CPU_CRIT_THRESHOLD) {
         char d[64]; snprintf(d, sizeof(d), "Node1 CPU Critical: %.1f%%", cpu);
         fault_register(1, 0, FAULT_CPU_OVERLOAD, SEV_CRITICAL, d);
     } else if (cpu >= CPU_WARN_THRESHOLD) {
@@ -320,8 +332,9 @@ static void fault_detector_evaluate(void) {
             fault_clear(1, t->task_id, FAULT_TASK_STARVATION);
         }
 
-        if (t->deadline_misses > 0) {
-            char d[64]; snprintf(d, sizeof(d), "Node1 Task '%s' Deadline Miss (%u)", t->name, t->deadline_misses);
+        /* Check current execution time against deadline (clears when normal) */
+        if (t->last_exec_us > t->deadline_ms * 1000U) {
+            char d[64]; snprintf(d, sizeof(d), "Node1 Task '%s' Deadline Miss (%u us)", t->name, t->last_exec_us);
             fault_register(1, t->task_id, FAULT_DEADLINE_MISS, SEV_WARNING, d);
         } else {
             fault_clear(1, t->task_id, FAULT_DEADLINE_MISS);
@@ -329,19 +342,35 @@ static void fault_detector_evaluate(void) {
     }
 
     /* IPC latency faults */
-    if (g.remote_ipc.p95_us >= IPC_CRIT_LATENCY_US) {
-        fault_register(1, 2, FAULT_IPC_TIMEOUT, SEV_CRITICAL, "Node1 IPC Latency Critical (P95 >50ms)");
+    if (g.sim_ipc_timeout) {
+        fault_register(1, 2, FAULT_IPC_TIMEOUT, SEV_CRITICAL, "[GPIO] IPC timeout simulated via Pin 18");
+    } else if (g.remote_ipc.p95_us >= IPC_CRIT_LATENCY_US) {
+        fault_register(1, 2, FAULT_IPC_TIMEOUT, SEV_CRITICAL, "Node1 IPC Latency Critical (P95 >300ms)");
     } else if (g.remote_ipc.p95_us >= IPC_WARN_LATENCY_US) {
-        fault_register(1, 2, FAULT_IPC_TIMEOUT, SEV_WARNING, "Node1 IPC Latency Elevated (P95 >1ms)");
+        fault_register(1, 2, FAULT_IPC_TIMEOUT, SEV_WARNING, "Node1 IPC Latency Elevated (P95 >220ms)");
     } else {
         fault_clear(1, 2, FAULT_IPC_TIMEOUT);
     }
 
     /* Node connection watchdog */
-    uint64_t age_ms = (get_time_us() - g.node1_last_rx_us) / 1000;
-    if (age_ms > 3000) {  /* 3 seconds without telemetry = disconnected */
+    if (g.sim_disconnect) {
         g.node1_connected = false;
-        fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "Node 1 Telemetry Timeout (>3s)");
+        fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "[GPIO] Node1 disconnect simulated via Pin 16");
+    } else {
+        uint64_t age_ms = (get_time_us() - g.node1_last_rx_us) / 1000;
+        if (age_ms > 3000) {  /* 3 seconds without telemetry = disconnected */
+            g.node1_connected = false;
+            fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "Node 1 Telemetry Timeout (>3s)");
+        } else {
+            fault_clear(1, 0, FAULT_NODE_DISCONNECTED);
+        }
+    }
+
+    /* Mirror Node 1's LED state if remote has elevated severity */
+    if (g.remote_led == LED_RED) {
+        hal_set_led(LED_RED);
+    } else if (g.remote_led == LED_YELLOW && g.led_state != LED_RED) {
+        hal_set_led(LED_YELLOW);
     }
 }
 
@@ -426,7 +455,6 @@ static void parse_telemetry(const char *json) {
 
 /* ============================================================================
  * TCP TELEMETRY SERVER  (Pi 2 listens; Pi 1 connects and sends)
- * design.md §9, §10
  * ============================================================================ */
 static void* telemetry_server_thread(void *arg) {
     (void)arg;
@@ -457,15 +485,35 @@ static void* telemetry_server_thread(void *arg) {
         int conn = (int)accept(srv, (struct sockaddr*)&cli_addr, &cli_len);
         if (conn < 0) continue;
 
+        /* Set 1.5s receive and send timeout so recv() / send() do not block indefinitely */
+        struct timeval tv;
+        tv.tv_sec  = 1;
+        tv.tv_usec = 500000;
+        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv));
+        setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, (const void*)&tv, sizeof(tv));
+
         printf("[Supervisor] Node 1 connected from %s\n", inet_ntoa(cli_addr.sin_addr));
-        g.node1_connected   = true;
+        if (!g.sim_disconnect) {
+            g.node1_connected   = true;
+            fault_clear(1, 0, FAULT_NODE_DISCONNECTED);
+        }
         g.node1_last_rx_us  = get_time_us();
-        fault_clear(1, 0, FAULT_NODE_DISCONNECTED);
 
         int remain = 0;
         while (g.running) {
             int n = recv(conn, rx + remain, (int)(sizeof(rx) - 1 - remain), 0);
-            if (n <= 0) break;
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* Check silence watchdog */
+                    uint64_t age = (get_time_us() - g.node1_last_rx_us) / 1000;
+                    if (age > 2000 || g.sim_disconnect) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if (n == 0) break; /* Remote end closed gracefully */
             remain += n;
             rx[remain] = '\0';
 
@@ -483,6 +531,9 @@ static void* telemetry_server_thread(void *arg) {
                 if (g.local_cpu_pct > 25.0f) g.local_cpu_pct = 25.0f;
                 g.node1_last_rx_us = get_time_us();
                 start = nl + 1;
+
+                /* Send acknowledgement to Node 1 so it can verify the link is alive */
+                send(conn, "ACK\n", 4, 0);
             }
             remain = (int)strlen(start);
             memmove(rx, start, remain + 1);
@@ -500,7 +551,6 @@ static void* telemetry_server_thread(void *arg) {
 
 /* ============================================================================
  * DIAGNOSTIC CLI — Supervisor (UART / Terminal)
- * design.md §14 — monitor> commands
  * ============================================================================ */
 static void cli_status(void) {
     printf("\n=======================================================\n");
@@ -512,8 +562,11 @@ static void cli_status(void) {
     printf(" Workload CPU   (N1) : %.1f %%\n", g.remote_cpu_pct);
     printf(" Node 1 Link         : %s\n",
            g.node1_connected ? "\033[32mCONNECTED\033[0m" : "\033[31mDISCONNECTED\033[0m");
-    printf(" Telemetry Packets   : %u rx\n", g.packets_received);
-    printf(" Active Faults       : %u\n", g.fault_counter);
+    uint32_t active_count = 0;
+    for (int i = 0; i < MAX_ACTIVE_FAULTS; i++) {
+        if (g.fault_map[i].active) active_count++;
+    }
+    printf(" Active Faults       : %u (Total Events: %u)\n", active_count, g.fault_counter);
     printf(" Uptime              : " FMT_U64 " ms\n", (uint64_t)(get_time_us() / 1000));
     printf(" Timers (Req D)      : timer_create(CLOCK_MONOTONIC) [Hardware Interval 500ms]\n");
     printf("=======================================================\n");
@@ -606,6 +659,19 @@ static void* supervisor_monitor_thread(void *arg) {
         float sample = base + jitter;
         if (sample < 0.8f) sample = 0.8f;
         analytics_update_local_cpu(sample);
+
+        /* Active watchdog: Detect if Node 1 goes silent or disconnects */
+        uint64_t now = get_time_us();
+        if (g.sim_disconnect) {
+            g.node1_connected = false;
+            fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "[GPIO] Node 1 Disconnect Simulated (Pin 16)");
+        } else if (g.node1_last_rx_us > 0) {
+            uint64_t age_ms = (now - g.node1_last_rx_us) / 1000;
+            if (age_ms > 2000) {  /* > 2 seconds without packet = Node 1 Disconnected */
+                g.node1_connected = false;
+                fault_register(1, 0, FAULT_NODE_DISCONNECTED, SEV_CRITICAL, "Node 1 Disconnected (>2s silent)");
+            }
+        }
     }
     rt_timer_destroy(&mon_timer);
     return NULL;
@@ -685,6 +751,10 @@ static void* cli_thread(void *arg) {
  * MAIN — Node 2 Entry Point
  * ============================================================================ */
 int main(int argc, char *argv[]) {
+    /* Block real-time timer signals so worker threads inherit mask and wait via sigwait */
+    rt_timers_block_signals();
+    signal(SIGPIPE, SIG_IGN);
+
     memset(&g, 0, sizeof(g));
     g.running   = true;
     g.node_id   = 2;
@@ -719,6 +789,10 @@ int main(int argc, char *argv[]) {
     rt_thread_create(&th_mon,  PRIORITY_MONITOR,        supervisor_monitor_thread, NULL);
     rt_thread_create(&th_tcp,  PRIORITY_TELEMETRY,      telemetry_server_thread,   NULL);
     if (enable_gpio) {
+        printf("\n[GPIO] Hardware Simulation Buttons (Hold=FAULT, Release=CLEAR):\n");
+        printf("  • Button 1 (Pin 16 / GPIO 23): Node 1 Disconnect Simulation [Red LED]\n");
+        printf("  • Button 2 (Pin 18 / GPIO 24): IPC Timeout Simulation       [Red LED]\n");
+        printf("  • Button 3 (Pin 22 / GPIO 25): CPU Overload Warning         [Yellow LED]\n\n");
         /* GPIO poll thread — level-based fault simulation via physical buttons */
         rt_thread_create(&th_gpio, PRIORITY_FAULT_DETECTOR, hal_gpio_poll_thread,
                          (void*)gpio_button_callback);

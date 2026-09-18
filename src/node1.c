@@ -1,12 +1,10 @@
 /**
  * ============================================================================
- * node1_workload.c  —  Raspberry Pi 1  (Monitored Workload Node)
- * Smart City RTOS Fault & Performance Monitoring Platform
+ * Monitored Node 1 — Smart City RTOS Fault & Performance Monitoring Platform
+ * ============================================================================
+ * Run:  ./node1
  *
- * Build in QNX Momentics IDE  →  Deploy to Raspberry Pi 1
- * Run:  ./node1_workload --ip=<Pi2_IP>
- *
- * What this node does (design.md §2, §3, §4):
+ * Description:
  *   - Runs 3 periodic city services with configurable periods/deadlines
  *   - Shared-memory IPC between Service A (producer) and Service B (consumer)
  *   - High-priority Monitoring Task samples heartbeat, deadline, CPU
@@ -26,7 +24,7 @@ extern void* hal_gpio_poll_thread(void *arg);
 extern void  hal_gpio_deinit(void);
 
 /* ============================================================================
- * NODE 1 GLOBAL CONTEXT
+ * GLOBAL CONTEXT
  * ============================================================================ */
 typedef struct {
     volatile bool running;
@@ -96,13 +94,12 @@ static void hal_set_led(HealthLedState state) {
 static void gpio_button_callback(int btn_id, bool pressed) {
     switch (btn_id) {
 
-        case 0:  /* GPIO 23 — Service B Task Starvation */
+        case 0:  /* GPIO 23 / Pin 16 — Service B Task Starvation */
             g.tasks[1].inject_starvation = pressed;
             if (pressed) {
-                printf("\n[GPIO] Pin 16 → GND HELD   : STARVATION active on Service_B\n");
-                printf("                               Heartbeat frozen — fault will appear in ~400ms\n");
+                printf("\n[NODE 1] [Service B Starvation] → PRESSED  (Heartbeat frozen → Red LED ON)\n");
             } else {
-                printf("\n[GPIO] Pin 16 → RELEASED   : Service_B heartbeat RESTORED — returning to NORMAL\n");
+                printf("\n[NODE 1] [Service B Starvation] → RELEASED (Heartbeat restored → Green LED)\n");
                 /* Manually reset last heartbeat time so monitoring task
                    does not immediately re-trigger starvation on release */
                 g.tasks[1].last_heartbeat_time_us = get_time_us();
@@ -110,24 +107,22 @@ static void gpio_button_callback(int btn_id, bool pressed) {
             printf("node1> "); fflush(stdout);
             break;
 
-        case 1:  /* GPIO 24 — CPU Overload Burner */
+        case 1:  /* GPIO 24 / Pin 18 — CPU Overload Burner */
             g.inject_cpu_overload = pressed;
             if (pressed) {
-                printf("\n[GPIO] Pin 18 → GND HELD   : CPU OVERLOAD burner ACTIVE\n");
-                printf("                               CPU will exceed 85%% threshold while contact is held\n");
+                printf("\n[NODE 1] [CPU Overload Burner]  → PRESSED  (CPU >85%% active → Red LED ON)\n");
             } else {
-                printf("\n[GPIO] Pin 18 → RELEASED   : CPU burner OFF — CPU returning to NORMAL\n");
+                printf("\n[NODE 1] [CPU Overload Burner]  → RELEASED (CPU burner OFF → Green LED)\n");
             }
             printf("node1> "); fflush(stdout);
             break;
 
-        case 2:  /* GPIO 25 — Service A Deadline Miss */
+        case 2:  /* GPIO 25 / Pin 22 — Service A Deadline Miss */
             g.tasks[0].inject_exec_delay_ms = pressed ? 100 : 0;
             if (pressed) {
-                printf("\n[GPIO] Pin 22 → GND HELD   : DEADLINE MISS active on Service_A\n");
-                printf("                               +100ms delay added → exceeds 80ms deadline\n");
+                printf("\n[NODE 1] [Service A Deadline Miss] → PRESSED  (+100ms delay → Yellow LED ON)\n");
             } else {
-                printf("\n[GPIO] Pin 22 → RELEASED   : Service_A deadline delay REMOVED — NORMAL\n");
+                printf("\n[NODE 1] [Service A Deadline Miss] → RELEASED (Delay removed → Green LED)\n");
             }
             printf("node1> "); fflush(stdout);
             break;
@@ -265,9 +260,9 @@ static void ipc_record_latency(uint32_t lat_us) {
 
     /* IPC fault thresholds */
     if (lat_us >= IPC_CRIT_LATENCY_US)
-        fault_register(2, FAULT_IPC_TIMEOUT, SEV_CRITICAL, "IPC Latency Critical (>50ms)");
+        fault_register(2, FAULT_IPC_TIMEOUT, SEV_CRITICAL, "IPC Latency Critical (>300ms)");
     else if (lat_us >= IPC_WARN_LATENCY_US)
-        fault_register(2, FAULT_IPC_TIMEOUT, SEV_WARNING,  "IPC Latency Elevated (>1ms)");
+        fault_register(2, FAULT_IPC_TIMEOUT, SEV_WARNING,  "IPC Latency Elevated (>220ms)");
     else
         fault_clear(2, FAULT_IPC_TIMEOUT);
 }
@@ -509,8 +504,7 @@ static void* cpu_burner_thread(void *arg) {
 }
 
 /* ============================================================================
- * HIGH-PRIORITY MONITORING TASK  (design.md §4)
- * Periodic interval timer via timer_create() / timer_settime() (Requirement D)
+ * HIGH-PRIORITY MONITORING TASK 
  * Samples heartbeat staleness, execution time, deadline, and CPU utilisation
  * ============================================================================ */
 static void* monitoring_task_thread(void *arg) {
@@ -624,10 +618,18 @@ static void build_json(char *buf, size_t sz) {
 static void* telemetry_sender_thread(void *arg) {
     (void)arg;
     char buf[1024];
+    char ack[32];
 
     while (g.running) {
         int sock = (int)socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) { sleep_ms(1000); continue; }
+
+        /* Set 1.5s send and receive timeouts so socket detects physical disconnect immediately */
+        struct timeval tv;
+        tv.tv_sec  = 1;
+        tv.tv_usec = 500000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const void*)&tv, sizeof(tv));
 
         struct sockaddr_in sv = {0};
         sv.sin_family = AF_INET;
@@ -637,9 +639,9 @@ static void* telemetry_sender_thread(void *arg) {
         printf("[Telemetry] Connecting to Supervisor %s:%d ...\n",
                g.supervisor_ip, g.supervisor_port);
         if (connect(sock, (struct sockaddr*)&sv, sizeof(sv)) < 0) {
-            perror("[Telemetry] Connect error");
             close(sock);
-            sleep_ms(2000); continue;
+            sleep_ms(1500);
+            continue;
         }
 
         printf("[Telemetry] Connected to Pi 2 Supervisor.\n");
@@ -647,10 +649,19 @@ static void* telemetry_sender_thread(void *arg) {
 
         while (g.running) {
             build_json(buf, sizeof(buf));
-            if (send(sock, buf, (int)strlen(buf), 0) <= 0) {
-                printf("[Telemetry] Supervisor connection lost.\n");
+            int sent = send(sock, buf, (int)strlen(buf), 0);
+            if (sent <= 0) {
+                printf("[Telemetry] Send failed — Supervisor link lost.\n");
                 break;
             }
+
+            /* Wait for Supervisor ACK (times out in 1.5s if Ethernet unplugged) */
+            int n = recv(sock, ack, sizeof(ack) - 1, 0);
+            if (n <= 0) {
+                printf("[Telemetry] Supervisor heartbeat missed (Ethernet disconnected) — reconnecting...\n");
+                break;
+            }
+
             sleep_ms(TELEMETRY_INTERVAL_MS);
         }
 
@@ -663,7 +674,6 @@ static void* telemetry_sender_thread(void *arg) {
 
 /* ============================================================================
  * FAULT INJECTION + DIAGNOSTIC CLI  (UART / Terminal)
- * design.md §14, §17
  * ============================================================================ */
 static void cli_status(void) {
     printf("\n=======================================================\n");
@@ -672,8 +682,11 @@ static void cli_status(void) {
     printf(" Platform         : %s\n", PLATFORM_NAME);
     printf(" Health LED       : %s\n", hal_led_str());
     printf(" CPU Utilization  : %.1f %%\n", g.total_cpu_pct);
-    printf(" Supervisor Link  : %s\n", g.tcp_connected ? "\033[32mCONNECTED\033[0m" : "\033[31mDISCONNECTED\033[0m");
-    printf(" Active Faults    : %u\n", g.fault_counter);
+    uint32_t active_count = 0;
+    for (int i = 0; i < MAX_ACTIVE_FAULTS; i++) {
+        if (g.fault_map[i].active) active_count++;
+    }
+    printf(" Active Faults    : %u (Total Events: %u)\n", active_count, g.fault_counter);
     printf(" Uptime           : " FMT_U64 " ms\n", (uint64_t)(get_time_us() / 1000));
     printf(" Timers (Req D)   : timer_create(CLOCK_MONOTONIC) [Hardware Interval]\n");
     printf(" Heartbeat IPC    : QNX MsgSend() -> MsgReceive() [ChID: %d, CoID: %d]\n", g.heartbeat_chid, g.heartbeat_coid);
@@ -699,25 +712,17 @@ static void cli_tasks(void) {
 }
 
 static void cli_cpu(void) {
-    printf("\n--- CPU UTILIZATION & PROCFS SAMPLING (Requirement A) ---\n");
-    printf(" Total Duty-Cycle : %.1f %%\n", g.total_cpu_pct);
+    printf("\n==================== CPU UTILIZATION ====================\n");
+    printf(" Total CPU Load   : %.1f %%\n", g.total_cpu_pct);
 
-    QnxProcSample sample;
-    if (qnx_procfs_sample_cpu(getpid(), &sample) == 0) {
-        printf(" Kernel Procfs    : /proc/%d/as (devctl DCMD_PROC_INFO)\n", (int)getpid());
-        printf("  Kernel UTime    : " FMT_U64 " ns\n", sample.utime_ns);
-        printf("  Kernel STime    : " FMT_U64 " ns\n", sample.stime_ns);
-        printf("  Total CPU Time  : " FMT_U64 " ns\n", sample.cpu_time_ns);
-        printf("  Active Threads  : %u\n", sample.num_threads);
-    }
-
-    printf("\n--- TASK BREAKDOWN & HARDWARE CLOCK CYCLES (ClockCycles()) ---\n");
+    printf("\n--- TASK BREAKDOWN ---\n");
     for (int i = 0; i < MAX_TASKS; i++) {
         TaskControlBlock *t = &g.tasks[i];
-        printf("  %-22s : %5.1f %%  (last=%u us  max=%u us  cycles=%u)\n",
-               t->name, t->cpu_usage_pct, t->last_exec_us, t->max_exec_us, t->total_cycles);
+        printf("  %-22s : %5.1f %%  (last=%u us  max=%u us)\n",
+               t->name, t->cpu_usage_pct, t->last_exec_us, t->max_exec_us);
     }
     printf(" CPU Overload Injected: %s\n", g.inject_cpu_overload ? "YES" : "NO");
+    printf("=========================================================\n");
 }
 
 static void cli_ipc(void) {
@@ -869,6 +874,10 @@ static void* cli_thread(void *arg) {
  * MAIN — Node 1 Entry Point
  * ============================================================================ */
 int main(int argc, char *argv[]) {
+    /* Block real-time timer signals so worker threads inherit mask and wait via sigwait */
+    rt_timers_block_signals();
+    signal(SIGPIPE, SIG_IGN);
+
     memset(&g, 0, sizeof(g));
     g.running       = true;
     g.node_id       = 1;
@@ -890,7 +899,7 @@ int main(int argc, char *argv[]) {
     RT_MUTEX_INIT(&g.trace_mutex);
     RT_COND_INIT(&g.ipc_cond);
 
-    /* --- Task Control Blocks: design.md §3 --- */
+    /* --- Task Control Blocks --- */
     g.tasks[0] = (TaskControlBlock){
         .task_id = 1, .period_ms = 100, .deadline_ms = 80,
         .priority = PRIORITY_SERVICE_A, .state = TASK_STATE_RUNNING };
@@ -946,6 +955,10 @@ int main(int argc, char *argv[]) {
     rt_thread_create(&th_burn, PRIORITY_CLI,         cpu_burner_thread,      NULL);
     rt_thread_create(&th_tcp,  PRIORITY_TELEMETRY,   telemetry_sender_thread, NULL);
     if (enable_gpio) {
+        printf("\n[GPIO] Hardware Fault Injection Buttons (Hold=FAULT, Release=CLEAR):\n");
+        printf("  • Button 1 (Pin 16 / GPIO 23): Service B Starvation  [Red LED]\n");
+        printf("  • Button 2 (Pin 18 / GPIO 24): CPU Overload Burner   [Red LED]\n");
+        printf("  • Button 3 (Pin 22 / GPIO 25): Service A Deadline Miss [Yellow LED]\n\n");
         /* GPIO button polling thread — triggers gpio_button_callback() on change */
         rt_thread_create(&th_gpio, PRIORITY_FAULT_DETECTOR, hal_gpio_poll_thread,
                          (void*)gpio_button_callback);
